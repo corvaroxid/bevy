@@ -82,7 +82,7 @@ impl Deref for AsyncComputeTaskPool {
 /// A newtype for a task pool for IO-intensive work (i.e. tasks that spend very little time in a
 /// "woken" state)
 #[derive(Debug)]
-pub struct IoTaskPool(TaskPool);
+pub struct IoTaskPool(pub TaskPool);
 
 impl IoTaskPool {
     /// Initializes the global [`IoTaskPool`] instance.
