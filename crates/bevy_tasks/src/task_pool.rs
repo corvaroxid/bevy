@@ -14,8 +14,8 @@ use crate::Task;
 #[derive(Debug, Default, Clone)]
 #[must_use]
 pub struct TaskPoolBuilder {
-    /// If set, we'll set up the thread pool to use at most `num_threads` threads.
-    /// Otherwise use the logical core count of the system
+    /// If set, we'll set up the thread pool to use at most n threads. Otherwise use
+    /// the logical core count of the system
     num_threads: Option<usize>,
     /// If set, we'll use the given stack size rather than the system default
     stack_size: Option<usize>,
@@ -60,9 +60,29 @@ impl TaskPoolBuilder {
     }
 }
 
+#[derive(Debug)]
+struct TaskPoolInner {
+    threads: Vec<JoinHandle<()>>,
+    shutdown_tx: async_channel::Sender<()>,
+}
+
+impl Drop for TaskPoolInner {
+    fn drop(&mut self) {
+        self.shutdown_tx.close();
+
+        let panicking = thread::panicking();
+        for join_handle in self.threads.drain(..) {
+            let res = join_handle.join();
+            if !panicking {
+                res.expect("Task thread panicked while executing.");
+            }
+        }
+    }
+}
+
 /// A thread pool for executing tasks. Tasks are futures that are being automatically driven by
 /// the pool on threads owned by the pool.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaskPool {
     /// The executor for the pool
     ///
@@ -72,8 +92,7 @@ pub struct TaskPool {
     executor: Arc<async_executor::Executor<'static>>,
 
     /// Inner state of the pool
-    threads: Vec<JoinHandle<()>>,
-    shutdown_tx: async_channel::Sender<()>,
+    inner: Arc<TaskPoolInner>,
 }
 
 impl TaskPool {
@@ -102,12 +121,23 @@ impl TaskPool {
                 let ex = Arc::clone(&executor);
                 let shutdown_rx = shutdown_rx.clone();
 
-                let thread_name = if let Some(thread_name) = thread_name {
-                    format!("{} ({})", thread_name, i)
-                } else {
-                    format!("TaskPool ({})", i)
+                // miri does not support setting thread names
+                // TODO: change back when https://github.com/rust-lang/miri/issues/1717 is fixed
+                #[cfg(not(miri))]
+                    let mut thread_builder = {
+                    let thread_name = if let Some(thread_name) = thread_name {
+                        format!("{} ({})", thread_name, i)
+                    } else {
+                        format!("TaskPool ({})", i)
+                    };
+                    thread::Builder::new().name(thread_name)
                 };
-                let mut thread_builder = thread::Builder::new().name(thread_name);
+                #[cfg(miri)]
+                    let mut thread_builder = {
+                    let _ = i;
+                    let _ = thread_name;
+                    thread::Builder::new()
+                };
 
                 if let Some(stack_size) = stack_size {
                     thread_builder = thread_builder.stack_size(stack_size);
@@ -125,14 +155,16 @@ impl TaskPool {
 
         Self {
             executor,
-            threads,
-            shutdown_tx,
+            inner: Arc::new(TaskPoolInner {
+                threads,
+                shutdown_tx,
+            }),
         }
     }
 
     /// Return the number of threads owned by the task pool
     pub fn thread_num(&self) -> usize {
-        self.threads.len()
+        self.inner.threads.len()
     }
 
     /// Allows spawning non-`'static` futures on the thread pool. The function takes a callback,
@@ -141,9 +173,9 @@ impl TaskPool {
     ///
     /// This is similar to `rayon::scope` and `crossbeam::scope`
     pub fn scope<'scope, F, T>(&self, f: F) -> Vec<T>
-    where
-        F: FnOnce(&mut Scope<'scope, T>) + 'scope + Send,
-        T: Send + 'static,
+        where
+            F: FnOnce(&mut Scope<'scope, T>) + 'scope + Send,
+            T: Send + 'static,
     {
         TaskPool::LOCAL_EXECUTOR.with(|local_executor| {
             // SAFETY: This function blocks until all futures complete, so this future must return
@@ -211,8 +243,8 @@ impl TaskPool {
     ///
     /// If the provided future is non-`Send`, [`TaskPool::spawn_local`] should be used instead.
     pub fn spawn<T>(&self, future: impl Future<Output = T> + Send + 'static) -> Task<T>
-    where
-        T: Send + 'static,
+        where
+            T: Send + 'static,
     {
         Task::new(self.executor.spawn(future))
     }
@@ -223,8 +255,8 @@ impl TaskPool {
     /// to be polled by the end-user. Users should generally prefer to use [`TaskPool::spawn`]
     /// instead, unless the provided future is not `Send`.
     pub fn spawn_local<T>(&self, future: impl Future<Output = T> + 'static) -> Task<T>
-    where
-        T: 'static,
+        where
+            T: 'static,
     {
         Task::new(TaskPool::LOCAL_EXECUTOR.with(|executor| executor.spawn(future)))
     }
@@ -233,20 +265,6 @@ impl TaskPool {
 impl Default for TaskPool {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for TaskPool {
-    fn drop(&mut self) {
-        self.shutdown_tx.close();
-
-        let panicking = thread::panicking();
-        for join_handle in self.threads.drain(..) {
-            let res = join_handle.join();
-            if !panicking {
-                res.expect("Task thread panicked while executing.");
-            }
-        }
     }
 }
 
